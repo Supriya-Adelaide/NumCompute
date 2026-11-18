@@ -1,28 +1,34 @@
+
 import os
 import sys
 
+import matplotlib
 import numpy as np
 import pytest
 
-
+matplotlib.use("Agg")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
 @pytest.fixture
 def rng():
-    """Provide a seeded random number generator for reproducible tests."""
     return np.random.default_rng(12345)
 
 
 @pytest.fixture
-def csv_file(tmp_path):
-    """Create a sample CSV file with numeric, categorical, and missing values."""
-    p = tmp_path / "data.csv"
-    p.write_text(
-        "a,b,c,label\n"
-        "1,2.5,x,0\n"
-        "4,,y,1\n"
-        "NA,6.0,x,1\n"
-        "7,8.5,,0\n"
-    )
-    return p
+def students():
+    
+    rows = np.array([
+        [1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 0, 1], [1, 1, 0, 1],
+        [1, 0, 1, 1],
+        [1, 0, 0, 0], [1, 0, 0, 0],
+        [0, 1, 1, 0], [0, 1, 1, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 0],
+    ])
+    return rows[:, :3].astype(float), rows[:, 3]
+
+
+@pytest.fixture
+def blobs(rng):
+    X = rng.normal(size=(1200, 4))
+    y = ((X[:, 0] > 0.2) & (X[:, 1] < 0.5)).astype(int)
+    return X, y

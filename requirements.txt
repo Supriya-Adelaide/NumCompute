@@ -1,5 +1,7 @@
 numpy>=1.23
-# development / demo
+matplotlib>=3.6
+# development / demo only
 pytest>=7
+pytest-cov
 jupyter
-matplotlib
+nbformat

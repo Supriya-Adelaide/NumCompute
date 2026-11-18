@@ -1,297 +1,176 @@
 
-import os
+
+from pathlib import Path
 
 import nbformat as nbf
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-nb = nbf.v4.new_notebook()
-cells = []
-md = lambda s: cells.append(nbf.v4.new_markdown_cell(s.strip()))
-code = lambda s: cells.append(nbf.v4.new_code_cell(s.strip()))
+md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
 
-md("""
-# NumCompute — Quickstart
+cells = [
+    md("""# NumCompute Stream: streaming decision-tree demo
 
-End-to-end tour of the NumPy-only toolkit:
+This notebook runs the full workflow the brief asks for:
 
-1. **I/O** – read a CSV with missing values (`io.py`)
-2. **Preprocessing** – `SimpleImputer`, `StandardScaler`, `OneHotEncoder` (`preprocessing.py`)
-3. **Sorting & searching** – top-k, quickselect, binary search (`sort_search.py`)
-4. **Ranking** – tie handling and percentiles (`rank.py`)
-5. **Statistics** – mean/variance, histogram, quantiles, streaming Welford (`stats.py`)
-6. **Gradients** – finite-difference gradient and Jacobian (`optim.py`)
-7. **Pipeline + metrics** – end-to-end model, accuracy/precision/recall/F1, confusion matrix, ROC-AUC
-8. **Benchmarks** – vectorised vs Python loops
-""")
+1. load a CSV with the package's own I/O module (`numcompute_stream.io`);
+2. split it into chunks to simulate data arriving over time;
+3. train a preprocessing + decision-tree pipeline incrementally with `.partial_fit()`;
+4. log metrics per chunk with `StreamTrainer` and plot them with `visualise.py`.
 
-code("""
-import os, sys, platform
+**Data.** `data/loan_stream.csv` holds 12,000 loan applications in time order
+(regenerate it with `python demo/make_dataset.py`). It has missing values, a new
+region category (`online`) that only appears after row 4,000, and a **change in the
+underlying rule at row 7,000** (concept drift), so we can watch the buffered tree
+recover after the drift."""),
+    code("""import sys, pathlib
+ROOT = pathlib.Path.cwd().resolve()
+ROOT = ROOT.parent if ROOT.name == "demo" else ROOT
+sys.path.insert(0, str(ROOT))                       # use the package from this repo
+
 import numpy as np
+import matplotlib.pyplot as plt
+import numcompute_stream as ncs
+from numcompute_stream import (io, visualise, Pipeline, ColumnTransformer, SimpleImputer,
+                               StandardScaler, OneHotEncoder, DecisionTreeClassifier,
+                               StreamTrainer, StreamingStats, StreamingHistogram)
 
-# Make the package importable when running from demo/ without `pip install -e .`
-ROOT = os.path.abspath("..") if os.path.basename(os.getcwd()) == "demo" else os.getcwd()
-sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, "benchmark"))
+%matplotlib inline
+DATA = ROOT / "demo" / "data" / "loan_stream.csv"
+OUT = ROOT / "demo" / "output"; OUT.mkdir(exist_ok=True)
+print("numcompute_stream", ncs.__version__, "| numpy", np.__version__)"""),
 
-import numcompute as nc
-from numcompute import io, preprocessing, sort_search, rank, stats, metrics, optim, pipeline, utils, benchmarking
+    md("## 1. Load the CSV with the custom I/O pipeline"),
+    code("""frame = io.read_csv(DATA)
+print(frame)
+NUM = frame.numeric_columns(); NUM.remove("default")
+CAT = frame.categorical_columns()
+TARGET = "default"
+print("numeric:", NUM)
+print("categorical:", CAT)
 
-np.set_printoptions(precision=4, suppress=True)
-DATA = os.path.join(ROOT, "demo", "data", "customers.csv")
-print("NumCompute", nc.__version__)
-for k, v in benchmarking.environment_info().items():
-    print(f"{k:>10}: {v}")
-""")
+missing = {c: int(np.isnan(frame[c]).sum()) for c in NUM}
+missing.update({c: int((frame[c] == "").sum()) for c in CAT})
+print("missing cells per column:", {k: v for k, v in missing.items() if v})"""),
 
-md("## 1. Reading CSV data (with missing values)")
-code("""
-# Numeric columns -> float array, missing cells (empty, NA, ?, null, NaN) -> NaN
-X_num, num_cols = io.read_csv(DATA, usecols=["age", "income", "hours_per_week"])
-print("numeric shape:", X_num.shape, num_cols)
-print("missing per column:", dict(zip(num_cols, io.count_missing(X_num).tolist())))
+    md("""## 2. Split into chunks and look at the stream
 
-# Rows with missing values
-rows_with_nan = np.flatnonzero(np.isnan(X_num).any(axis=1))
-print("rows with missing values:", rows_with_nan)
-print(X_num[rows_with_nan[:4]])
-""")
-code("""
-# Option A: drop incomplete rows
-X_drop, _ = io.read_csv(DATA, usecols=[0, 1, 2], drop_missing=True)
-print("after drop_missing:", X_drop.shape)
+`io.iter_csv` reads the file lazily, 250 rows at a time, so the data never has to be
+in memory all at once. While streaming we update running statistics with
+`StreamingStats.update_stats()` and watch the default rate per chunk."""),
+    code("""CHUNK = 250
+stats = StreamingStats()
+hist = StreamingHistogram(bins=20, range=(0, 1), window=8)   # debt-to-income, last 8 chunks
+default_rate = []
+for chunk in io.iter_csv(DATA, CHUNK):
+    stats.update_stats(chunk.to_array(NUM))
+    hist.update_stats(chunk["debt_to_income"])
+    default_rate.append(chunk[TARGET].mean())
 
-# Option B: typed columns (numeric vs categorical inferred per column)
-cols = io.read_csv_columns(DATA)
-print({k: v.dtype for k, v in cols.items()})
-X_cat = np.column_stack([cols["city"], cols["plan"]])
-y = cols["churn"].astype(int)
-print("categorical sample:", X_cat[:3].tolist(), "| class balance:", np.bincount(y))
+print(f"{len(default_rate)} chunks of {CHUNK} rows")
+for name, m, s, n in zip(NUM, stats.mean, stats.std(), stats.count_):
+    print(f"  {name:<15} mean={m:9.3f}  std={s:8.3f}  observed={n}")
+check = frame.to_array(NUM)
+print("matches one-pass NumPy:", np.allclose(stats.mean, np.nanmean(check, axis=0)))"""),
+    code("""fig, ax = visualise.plot_metric_over_time(default_rate, "Default rate per chunk", "share defaulted",
+                                         retrain_points=[7000 // CHUNK])
+ax.legend(["default rate", "drift point (row 7,000)"], frameon=False, fontsize=8)
+plt.show()"""),
 
-# Option C: streaming in chunks (constant memory)
-print("chunk shapes:", [c.shape for c in io.iter_csv_chunks(DATA, chunksize=64)])
-""")
+    md("""## 3. Build the pipeline and train it with `.partial_fit()`
 
-md("## 2. Preprocessing")
-code("""
-imp = preprocessing.SimpleImputer(strategy="median")
-X_imp = imp.fit_transform(X_num)
-print("imputed medians:", imp.statistics_)
+Numeric columns are imputed (running median) and scaled (running mean/variance);
+categorical columns are one-hot encoded with categories added as they appear. The
+encoder goes last so new columns are appended at the end. The tree retrains every
+`buffer_size` samples."""),
+    code("""def make_pipeline(buffer_size=1000, max_depth=5):
+    numeric = Pipeline([("impute", SimpleImputer("median", random_state=0)),
+                        ("scale", StandardScaler())])
+    prep = ColumnTransformer([("num", numeric, NUM), ("cat", OneHotEncoder(), CAT)])
+    return Pipeline([("prep", prep),
+                     ("model", DecisionTreeClassifier(max_depth=max_depth, buffer_size=buffer_size))])
 
-scaler = preprocessing.StandardScaler()
-X_std = scaler.fit_transform(X_imp)
-print("mean after scaling:", X_std.mean(0), " std:", X_std.std(0))
+pipe = make_pipeline(buffer_size=1000)
+pipe"""),
+    code("""# the plain loop the brief describes: one partial_fit per chunk
+for i, chunk in enumerate(io.iter_csv(DATA, CHUNK)):
+    pipe.partial_fit(chunk, chunk[TARGET].astype(int))
+    tree = pipe["model"]
+    if i < 10 or tree.buffer_fill == 0 and i % 8 == 3:
+        print(f"chunk {i:>2}: retrains={tree.n_retrains_}  buffer={tree.buffer_fill:>4}  "
+              f"one-hot columns={pipe['prep'].transformers[1][1].n_features_out_}")
+print("final one-hot categories:", pipe["prep"].transformers[1][1].categories_)"""),
 
-mm = preprocessing.MinMaxScaler(feature_range=(0, 1))
-print("min-max range:", mm.fit_transform(X_imp).min(0), mm.fit_transform(X_imp).max(0))
+    md("""## 4. Prequential run with logging (`StreamTrainer`)
 
-enc = preprocessing.OneHotEncoder(handle_unknown="ignore")
-X_oh = enc.fit_transform(np.where(X_cat == "", "unknown", X_cat))
-print("one-hot shape:", X_oh.shape)
-print(enc.get_feature_names(["city", "plan"]))
-""")
+Each chunk is **scored first, then used for training**, so every prediction is made
+on data the model has not seen. The log records chunk, cumulative and rolling
+accuracy, AUC, fit time, retrains, buffer fill and model memory."""),
+    code("""trainer = StreamTrainer(make_pipeline(buffer_size=1000), rolling_window=1000,
+                        name="tree b=1000", verbose=True)
+for chunk in io.iter_csv(DATA, CHUNK):
+    trainer.step(chunk, chunk[TARGET].astype(int))
+trainer.to_csv(OUT / "stream_log_b1000.csv")
+trainer.summary()"""),
+    code("""h = trainer.history
+fig, ax = visualise.plot_metric_over_time(h["rolling_accuracy"], "Rolling accuracy (last 1,000 samples)",
+                                         "accuracy", retrain_points=trainer.retrain_chunks(),
+                                         ylim=(0.5, 0.9), save_path=OUT / "rolling_accuracy.png")
+ax.axvline(7000 // CHUNK, color="#e34948", lw=1.5); ax.text(7000 // CHUNK + 0.4, 0.52, "drift", color="#e34948", fontsize=8)
+plt.show()"""),
+    code("""fig, axes = visualise.plot_stream_dashboard(h, title="Streaming run, buffer_size = 1000",
+                                           save_path=OUT / "dashboard.png")
+plt.show()"""),
 
-md("## 3. Sorting & searching")
-code("""
-income = X_imp[:, 1]
-vals, idx = sort_search.topk(income, k=5)                      # argpartition, O(n)
-print("top-5 incomes:", vals, "at rows", idx)
-vals, idx = sort_search.topk(income, k=3, largest=False)
-print("bottom-3 incomes:", vals)
+    md("""## 5. Comparing buffer sizes
 
-k = len(income) // 2
-print("quickselect median-ish:", sort_search.quickselect(income, k), "== np.sort:", np.sort(income)[k])
+A small buffer retrains often on little data (fast to adapt, noisier); a large buffer
+trains on more data but reacts slowly to drift."""),
+    code("""runs = {}
+for b in (250, 1000, 4000):
+    t = StreamTrainer(make_pipeline(buffer_size=b), rolling_window=1000, name=f"b={b}")
+    for chunk in io.iter_csv(DATA, CHUNK):
+        t.step(chunk, chunk[TARGET].astype(int))
+    runs[b] = t
+    s = t.summary()
+    print(f"buffer {b:>5}: cumulative acc={s['final_accuracy']:.3f}  retrains={s['retrains']:>2}  "
+          f"total fit time={s['total_fit_time_s']:.2f}s")
 
-sorted_inc = sort_search.stable_sort(income)
-pos, found = sort_search.binary_search(sorted_inc, sorted_inc[10])
-print("binary_search existing ->", pos, found)
-pos, found = sort_search.binary_search(sorted_inc, [0.0, 75.0, 1e6])
-print("insertion indices:", pos, "found:", found)
+fig, ax = visualise.compare_models(runs[1000].history["rolling_accuracy"],
+                                   runs[4000].history["rolling_accuracy"],
+                                   labels=("buffer_size=1000", "buffer_size=4000"),
+                                   title="Rolling accuracy: frequent vs rare retraining",
+                                   ylim=(0.5, 0.9), save_path=OUT / "compare_buffers.png")
+ax.axvline(7000 // CHUNK, color="#e34948", lw=1.5)
+plt.show()"""),
 
-# Multi-key sort: by plan (asc) then income (desc)
-plan = np.where(cols["plan"] == "", "unknown", cols["plan"])
-keys = np.empty((len(plan), 2), dtype=object)       # object array keeps numbers numeric
-keys[:, 0], keys[:, 1] = plan, income
-order = sort_search.multikey_argsort(keys, keys=[0, 1], descending=[False, True])
-print(np.column_stack([plan, np.round(income, 1)])[order][[0, 1, 2, -3, -2, -1]])
-""")
+    md("""## 6. Predictions vs ground truth on the latest chunk
 
-md("## 4. Ranking with ties & percentiles")
-code("""
-scores = np.array([88, 92, 75, 92, 60, 88, 100])
-for m in ["average", "min", "max", "dense", "ordinal"]:
-    print(f"{m:>8}:", rank.rank(scores, method=m))
-print("descending dense:", rank.rank(scores, "dense", ascending=False))
-print("NaN kept:", rank.rank([3.0, np.nan, 1.0]))
-""")
-code("""
-for interp in ["linear", "lower", "higher", "midpoint", "nearest"]:
-    print(f"{interp:>8} P90 income:", rank.percentile(X_num[:, 1], 90, interp, nan_policy="omit"))
-print("quartiles per column:\\n", rank.percentile(X_num, [25, 50, 75], axis=0, nan_policy="omit"))
-print("matches numpy:", np.allclose(rank.percentile(X_imp, [25, 50, 75], axis=0), np.percentile(X_imp, [25, 50, 75], axis=0)))
-""")
+The trainer keeps the predictions it made for the last chunk *before* training on it,
+so this is an honest out-of-sample view (predicting again now would score the tree on
+rows it has just been trained on)."""),
+    code("""y_true, y_pred = trainer.last_y_true_, trainer.last_y_pred_
+fig, axes = visualise.plot_predictions_vs_ground_truth(y_true, y_pred, labels=[0, 1],
+                                                      save_path=OUT / "predictions.png")
+plt.show()
+print(ncs.metrics.confusion_matrix(y_true, y_pred))"""),
 
-md("## 5. Statistics")
-code("""
-print("mean (skipna):", stats.mean(X_num, axis=0, skipna=True))
-print("var  (skipna):", stats.var(X_num, axis=0, ddof=1, skipna=True))
-print("mean (no skip, NaN propagates):", stats.mean(X_num, axis=0))
-print("quantiles 0.1/0.5/0.9 of age:", stats.quantile(X_num[:, 0], [0.1, 0.5, 0.9], skipna=True))
+    md("## 7. What the current tree learned"),
+    code("""names = trainer.model["prep"].get_feature_names_out()
+tree = trainer.model["model"]
+print(f"depth={tree.get_depth()}  leaves={tree.get_n_leaves()}  trained on the last {tree.n_node_samples_[0]} samples")
+print(tree.export_text(names)[:1800])
+fig, ax = visualise.plot_feature_importances(names, tree.feature_importances_,
+                                             title="Feature importance after drift",
+                                             save_path=OUT / "importances.png")
+plt.show()"""),
+    md("""After the drift the tree leans on `debt_to_income`, `late_payments` and
+`region=online`, which is the new rule in the data; the credit score that drove the
+earlier rule has dropped down the list. The buffered retrain is what let the model
+pick this up."""),
+]
 
-d = stats.describe(X_num)
-for key, val in d.items():
-    print(f"{key:>9}:", val)
-""")
-code("""
-counts, edges = stats.histogram(X_num[:, 1], bins=10)          # NaNs ignored
-for c, lo, hi in zip(counts, edges[:-1], edges[1:]):
-    print(f"[{lo:6.1f}, {hi:6.1f})  {'#' * int(c):s} {c}")
-
-# Streaming Welford over CSV chunks equals the batch result
-rs = stats.RunningStats()
-for chunk in io.iter_csv_chunks(DATA, chunksize=50):
-    rs.update(chunk[:, :3])
-print("streaming mean:", rs.mean, "\\nbatch mean:    ", np.nanmean(X_num, 0))
-print("streaming var: ", rs.var(ddof=1), "\\nbatch var:     ", np.nanvar(X_num, 0, ddof=1))
-""")
-code("""
-try:
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.bar(edges[:-1], counts, width=np.diff(edges), align="edge", edgecolor="white")
-    ax.set_xlabel("income"); ax.set_ylabel("count"); ax.set_title("numcompute.stats.histogram")
-    plt.show()
-except ImportError:
-    print("matplotlib not installed – skipping plot (optional)")
-""")
-
-md("## 6. Finite-difference gradients & Jacobians")
-code("""
-f = lambda v: float(v[0] ** 2 + 3 * v[0] * v[1] + np.sin(v[1]))
-df = lambda v: np.array([2 * v[0] + 3 * v[1], 3 * v[0] + np.cos(v[1])])
-x0 = np.array([1.0, 2.0])
-for method in ["central", "forward", "backward"]:
-    g = optim.grad(f, x0, method=method)
-    print(f"{method:>8}: {g}  |error| = {np.abs(g - df(x0)).max():.2e}")
-print("analytic:", df(x0))
-
-F = lambda v: np.array([v[0] * v[1], np.exp(v[0]), v[1] ** 2])
-print("Jacobian (3x2):\\n", optim.jacobian(F, x0))
-
-# Error vs step size: truncation (large h) vs round-off (small h)
-for h in [1e-1, 1e-3, 1e-5, 1e-8, 1e-11]:
-    print(f"h={h:.0e}  central err={np.abs(optim.grad(f, x0, h=h) - df(x0)).max():.2e}"
-          f"  forward err={np.abs(optim.grad(f, x0, h=h, method='forward') - df(x0)).max():.2e}")
-
-res = optim.gradient_descent(lambda v: float((v[0] - 3) ** 2 + 10 * (v[1] + 1) ** 2), [10.0, 4.0])
-print("gradient descent ->", res["x"], "in", res["n_iter"], "iterations")
-""")
-
-md("## 7. Pipeline + model + metrics")
-code("""
-# Mixed numeric / categorical matrix
-X_all = np.empty((len(y), 5), dtype=object)
-X_all[:, :3] = X_num
-X_all[:, 3] = np.where(cols["city"] == "", "unknown", cols["city"])
-X_all[:, 4] = np.where(cols["plan"] == "", "unknown", cols["plan"])
-
-pre = pipeline.ColumnTransformer([
-    ("num", pipeline.Pipeline([("impute", preprocessing.SimpleImputer("median")),
-                               ("scale", preprocessing.StandardScaler())]), [0, 1, 2]),
-    ("cat", preprocessing.OneHotEncoder(handle_unknown="ignore"), [3, 4]),
-])
-model = pipeline.Pipeline([("prep", pre), ("clf", pipeline.LogisticRegressionGD(lr=0.3, n_iter=800))])
-
-# Simple train/test split
-perm = np.random.default_rng(0).permutation(len(y))
-tr, te = perm[:150], perm[150:]
-model.fit(X_all[tr], y[tr])
-y_pred = model.predict(X_all[te])
-y_prob = model.predict_proba(X_all[te])[:, 1]
-print(model)
-""")
-code("""
-print("accuracy :", metrics.accuracy(y[te], y_pred))
-print("precision:", metrics.precision(y[te], y_pred))
-print("recall   :", metrics.recall(y[te], y_pred))
-print("f1       :", metrics.f1(y[te], y_pred))
-print("macro f1 :", metrics.f1(y[te], y_pred, average="macro"))
-print("confusion matrix (rows=true, cols=pred):\\n", metrics.confusion_matrix(y[te], y_pred))
-fpr, tpr, thr = metrics.roc_curve(y[te], y_prob)
-print("ROC-AUC  :", round(metrics.auc(fpr, tpr), 4))
-baseline = pipeline.MajorityClassifier().fit(X_imp[tr], y[tr])
-print("majority-class baseline accuracy:", metrics.accuracy(y[te], baseline.predict(X_imp[te])))
-
-# Regression example: predict income from age & hours
-reg = pipeline.Pipeline([("scale", preprocessing.StandardScaler()), ("ols", pipeline.LeastSquaresRegressor())])
-reg.fit(X_imp[tr][:, [0, 2]], X_imp[tr][:, 1])
-print("income MSE:", metrics.mse(X_imp[te][:, 1], reg.predict(X_imp[te][:, [0, 2]])),
-      "| R^2:", round(metrics.r2_score(X_imp[te][:, 1], reg.predict(X_imp[te][:, [0, 2]])), 3))
-""")
-code("""
-try:
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(4, 4))
-    ax.plot(fpr, tpr, marker=".", label=f"AUC = {metrics.auc(fpr, tpr):.3f}")
-    ax.plot([0, 1], [0, 1], "--", color="grey")
-    ax.set_xlabel("FPR"); ax.set_ylabel("TPR"); ax.set_title("ROC (numcompute.metrics)"); ax.legend()
-    plt.show()
-except ImportError:
-    print("matplotlib not installed – skipping plot (optional)")
-""")
-
-md("""
-## 8. Benchmarks: vectorised vs Python loops
-
-Small inline version of `benchmark/run_benchmarks.py` (run that script for the full table
-written to `benchmark/results.md`). Timings: best of 5 runs after one warm-up;
-every implementation is checked to return the same result.
-""")
-code("""
-import loop_impls as L
-rng = np.random.default_rng(0)
-Xb = rng.normal(size=(20_000, 8)); Xbl = Xb.tolist()
-A, B = rng.normal(size=(300, 16)), rng.normal(size=(200, 16)); Al, Bl = A.tolist(), B.tolist()
-xb = rng.normal(size=200_000); xbl = xb.tolist()
-yt, yp = rng.integers(0, 5, 100_000), rng.integers(0, 5, 100_000); ytl, ypl = yt.tolist(), yp.tolist()
-
-rows = []
-rows += benchmarking.compare({"python loop": lambda: L.standardize_loop(Xbl),
-                              "numcompute": lambda: preprocessing.StandardScaler().fit_transform(Xb)}, task="StandardScaler")
-rows += benchmarking.compare({"python loop": lambda: L.pairwise_euclidean_loop(Al, Bl),
-                              "numcompute": lambda: utils.pairwise_distances(A, B)}, task="Pairwise distances")
-rows += benchmarking.compare({"python loop": lambda: L.histogram_loop(xbl, 30),
-                              "numcompute": lambda: stats.histogram(xb, 30)[0]}, task="Histogram")
-rows += benchmarking.compare({"python sorted()": lambda: L.topk_loop(xbl, 10),
-                              "numcompute topk": lambda: sort_search.topk(xb, 10, return_indices=False)}, task="Top-10")
-rows += benchmarking.compare({"python loop": lambda: L.confusion_matrix_loop(ytl, ypl, 5),
-                              "numcompute": lambda: metrics.confusion_matrix(yt, yp)}, task="Confusion matrix")
-print(benchmarking.format_table(rows))
-""")
-code("""
-try:
-    import matplotlib.pyplot as plt
-    tasks = list(dict.fromkeys(r["task"] for r in rows))
-    speed = [max(r["speedup"] for r in rows if r["task"] == t) for t in tasks]
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.barh(tasks, speed); ax.set_xscale("log"); ax.set_xlabel("speed-up vs Python loop (log scale)")
-    for i, s in enumerate(speed):
-        ax.text(s, i, f" {s:.0f}×", va="center")
-    plt.tight_layout(); plt.show()
-except ImportError:
-    pass
-""")
-
-md("""
-## Environment notes
-
-* Only **Python ≥ 3.9 + NumPy ≥ 1.23** are required by the package; `matplotlib` is optional
-  and used only for the plots above.
-* Benchmark numbers depend on CPU, NumPy build (BLAS/SIMD) and background load —
-  re-run the cells (or `python benchmark/run_benchmarks.py`) on your own machine before
-  quoting figures in the report.
-""")
-
+nb = nbf.v4.new_notebook()
 nb["cells"] = cells
-nb["metadata"]["kernelspec"] = {"display_name": "Python 3", "language": "python", "name": "python3"}
-nbf.write(nb, os.path.join(HERE, "quickstart.ipynb"))
-print("wrote demo/quickstart.ipynb")
+nb["metadata"]["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
+out = Path(__file__).with_name("stream_demo.ipynb")
+nbf.write(nb, out)
+print(f"wrote {out}")
